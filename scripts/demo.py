@@ -12,6 +12,10 @@ concurrent  submit batches while a background comparison is running:
             covers the latest corpus, and stale computations are discarded
 restart     submit a batch, restart the API processes, and watch
             verification complete automatically after the restart
+ingest      dual-source ingestion (双源核验): an article is approved into
+            the corpus only once both crawl pipelines report identical
+            text+side; conflicts and retractions withdraw it, late reports
+            cannot resurrect it, replays never bump the generation
 
 Runs against any base URL (host port or in-compose service name) and uses
 only the standard library, so it also works inside the slim API image.
@@ -201,18 +205,26 @@ def expect(condition, message):
 
 
 def reset_to_seed(base):
-    """Atomically replace the whole corpus with the demo seed articles."""
+    """Atomically replace the manual corpus with the demo seed articles.
+
+    Ingestion-managed articles (origin=ingest) are never touched by manual
+    batches — that is the whole point of the namespace isolation — so they
+    are left alone here; on a fresh deployment none exist anyway.
+    """
     seed = build_demo_articles()
     sims = verify_demo_articles(seed)
     code, body = http(base, "GET", "/articles")
-    existing = [a["id"] for a in body.get("articles", [])]
+    existing = [a["id"] for a in body.get("articles", []) if a.get("origin") == "manual"]
+    skipped = [a["id"] for a in body.get("articles", []) if a.get("origin") == "ingest"]
+    if skipped:
+        print(f"  note: {len(skipped)} ingest-managed article(s) left untouched: {skipped}")
     code, body = http(
         base,
         "POST",
         "/articles/batch",
         {"upserts": seed, "deletes": [i for i in existing if i not in {a["id"] for a in seed}]},
     )
-    expect(code == 200, f"seed batch committed (generation {body['generation']})")
+    expect(code == 200, f"seed batch committed (generation {body.get('generation')})")
     wait_ready(base)
     print("  shingle similarities inside the seed corpus:")
     for (a, b), s in sorted(sims.items()):
@@ -367,11 +379,92 @@ def scenario_restart(base, restart_cmd):
 # ---------------------------------------------------------------------------
 
 
+def scenario_ingest(base):
+    print("== ingest: dual-source verification (双源核验) ==")
+    rng = random.Random(SEED + 3)
+    text_v1 = pseudo_article(rng)
+    text_v2 = pseudo_article(rng)
+    # Ingestion state is append-only by design (retractions are tombstones),
+    # so each demo run uses a fresh article id.
+    aid = f"wire-story-{int(time.time() * 1000)}"
+    print(f"  demo article id: {aid}")
+
+    def report(source, revision, side=None, text=None, retracted=False):
+        payload = {"source": source, "id": aid, "revision": revision,
+                   "retracted": retracted}
+        if side is not None:
+            payload["side"] = side
+        if text is not None:
+            payload["text"] = text
+        return http(base, "POST", "/ingest/reports", payload)
+
+    def verdict():
+        code, body = http(base, "GET", f"/ingest/articles/{aid}")
+        expect(code == 200, "ingest status queryable by id")
+        return body
+
+    code, body = report("A", 1, side="train", text=text_v1)
+    expect(code == 200 and body["status"] == "pending" and not body["corpus_changed"],
+           "only source A arrived -> pending, corpus untouched")
+    code, body = report("B", 1, side="train", text=text_v1)
+    expect(code == 200 and body["status"] == "approved" and body["corpus_changed"],
+           "both pipelines agree -> approved into the corpus")
+    gen = body["generation"]
+
+    code, body = report("B", 1, side="train", text=text_v1)
+    expect(code == 200 and body["replayed"] and body["generation"] == gen,
+           "same revision + same content replayed: idempotent, no generation bump")
+    code, _ = report("B", 1, side="test", text=text_v1)
+    expect(code == 409, "same revision with different content rejected (409)")
+
+    code, body = report("A", 2, side="train", text=text_v2)
+    expect(code == 200 and body["status"] == "conflict" and body["corpus_changed"],
+           "source A revises -> conflict, article withdrawn from the corpus")
+    state = verdict()
+    expect(state["conflicts"] == ["text"]
+           and state["sources"]["A"]["revision"] == 2
+           and state["sources"]["B"]["revision"] == 1,
+           "conflict query shows both source versions for re-crawling")
+
+    code, _ = report("A", 1, side="train", text=text_v1)
+    expect(code == 409, "late old revision rejected (409) — no resurrection")
+    code, body = report("B", 2, side="train", text=text_v2)
+    expect(code == 200 and body["status"] == "approved",
+           "source B converges -> approved again")
+    code, _ = report("B", 1, side="train", text=text_v1)
+    expect(code == 409, "stale duplicate from B rejected too (409)")
+
+    code, body = report("A", 3, retracted=True)
+    expect(code == 200 and body["status"] == "retracted" and body["corpus_changed"],
+           "source A retracts -> article withdrawn")
+    code, _ = report("A", 2, side="train", text=text_v2)
+    expect(code == 409, "pre-retraction content arriving late rejected — no resurrection")
+    code, body = report("A", 3, retracted=True)
+    expect(code == 200 and body["replayed"], "retraction replay is an idempotent no-op")
+
+    code, body = report("A", 4, side="test", text=text_v1)
+    expect(code == 200 and body["status"] == "conflict" and not body["corpus_changed"],
+           "new content from A alone conflicts with B's older report")
+    code, body = report("B", 4, side="test", text=text_v1)
+    expect(code == 200 and body["status"] == "approved",
+           "both pipelines re-report at revision 4 -> approved with the new side")
+
+    wait_ready(base)
+    code, body = http(base, "GET", "/articles")
+    mine = [a for a in body["articles"] if a["id"] == aid]
+    expect(len(mine) == 1 and mine[0]["origin"] == "ingest" and mine[0]["side"] == "test",
+           "approved article visible in the corpus with origin=ingest")
+    print("ingest scenario done.\n")
+
+
+# ---------------------------------------------------------------------------
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "scenario",
-        choices=["seed", "bridge", "concurrent", "restart", "all", "wait", "status"],
+        choices=["seed", "bridge", "concurrent", "restart", "ingest", "all", "wait", "status"],
     )
     parser.add_argument("--base", default=DEFAULT_BASE, help="API base URL")
     parser.add_argument(
@@ -396,10 +489,13 @@ def main():
         scenario_concurrent(base)
     elif args.scenario == "restart":
         scenario_restart(base, args.restart_cmd)
+    elif args.scenario == "ingest":
+        scenario_ingest(base)
     elif args.scenario == "all":
         scenario_seed(base)
         scenario_bridge(base)
         scenario_concurrent(base)
+        scenario_ingest(base)
         scenario_restart(base, args.restart_cmd)
 
 

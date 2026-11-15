@@ -7,7 +7,11 @@ never blocks corpus submissions and vice versa.
 Tables
 ------
 meta                 single row: current_generation / published_generation
-articles             committed corpus (id, side, text, updated_generation)
+articles             committed corpus (id, side, text, origin, updated_generation);
+                     origin is 'manual' (POST /articles/batch) or 'ingest'
+                     (approved by dual-source verification)
+ingest_reports       latest accepted report per (article_id, source A/B):
+                     monotonic revision, content or retraction
 edges / article_groups  published verification results, keyed by generation
 compute_jobs         pending/running background verification jobs (lease based)
 """
@@ -26,7 +30,19 @@ CREATE TABLE IF NOT EXISTS articles (
     id TEXT PRIMARY KEY,
     side TEXT NOT NULL CHECK (side IN ('train', 'test')),
     text TEXT NOT NULL CHECK (length(text) BETWEEN 5 AND 2000),
+    origin TEXT NOT NULL DEFAULT 'manual' CHECK (origin IN ('manual', 'ingest')),
     updated_generation INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ingest_reports (
+    article_id TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('A', 'B')),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    kind TEXT NOT NULL CHECK (kind IN ('content', 'retraction')),
+    side TEXT CHECK (side IN ('train', 'test')),
+    text TEXT,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (article_id, source)
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -76,6 +92,14 @@ def init_db(db_path: str) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        # Migration for databases created before the origin column existed:
+        # every pre-existing article came through the manual batch API.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(articles)")}
+        if "origin" not in columns:
+            conn.execute(
+                "ALTER TABLE articles ADD COLUMN origin TEXT NOT NULL"
+                " DEFAULT 'manual' CHECK (origin IN ('manual', 'ingest'))"
+            )
         conn.execute(
             "INSERT OR IGNORE INTO meta (id, current_generation, published_generation)"
             " VALUES (1, 0, 0)"

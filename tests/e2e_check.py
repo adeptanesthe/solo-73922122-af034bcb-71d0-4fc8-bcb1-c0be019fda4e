@@ -6,8 +6,16 @@ services), then verifies: input validation, batch atomicity, the 300-article
 limit, 202 pending gating, contamination groups/edges, bridge-article group
 splitting, modify-while-comparing (stale results discarded), cross-process
 consistency, crash/restart recovery and no stale/mixed published results.
+
+The dual-source ingestion API is covered as well: pending/approved/conflict/
+retracted verdicts, monotonic revisions (idempotent replays, stale and
+same-revision-different-content rejections), withdrawal on mismatch and
+retraction, no resurrection by late reports, generation bumps only when the
+approved corpus changes, manual/ingest namespace isolation, concurrent
+cross-instance reporting and ingested articles flowing into /contamination.
 """
 
+import concurrent.futures
 import os
 import shutil
 import socket
@@ -117,6 +125,7 @@ def main():
 
     try:
         run_checks(base1, base2, s1, s2)
+        run_ingest_checks(base1, base2)
     finally:
         s1.kill()
         s2.kill()
@@ -287,6 +296,223 @@ def run_checks(base1, base2, s1, s2):
     check("clean corpus reported as uncontaminated once verified",
           r.status_code == 200 and r.json()["contaminated"] is False
           and r.json()["groups"] == [])
+
+
+def run_ingest_checks(base1, base2):
+    """Dual-source ingestion (双源核验) requirement checks."""
+    from scripts.demo import alter, pseudo_article
+    import random
+
+    def report(base, **payload):
+        return httpx.post(f"{base}/ingest/reports", json=payload, timeout=10)
+
+    def gen(base):
+        return httpx.get(f"{base}/status", timeout=5).json()["current_generation"]
+
+    def corpus_ids(base):
+        return {a["id"] for a in httpx.get(f"{base}/articles", timeout=5).json()["articles"]}
+
+    rng = random.Random(20261115)
+    text_v1 = pseudo_article(rng)
+    text_v2 = pseudo_article(rng)
+
+    # ---- report validation -------------------------------------------------
+    r = report(base1, source="A", id="ing-x", revision=1, retracted=True,
+               text="retraction must not carry text")
+    check("retraction carrying text rejected (422)", r.status_code == 422)
+    r = report(base1, source="A", id="ing-x", revision=1, text="missing the side field")
+    check("content report without side rejected (422)", r.status_code == 422)
+    r = report(base1, source="A", id="ing-x", revision=0, side="train", text="revision zero")
+    check("revision 0 rejected (422)", r.status_code == 422)
+    r = report(base1, source="C", id="ing-x", revision=1, side="train", text="bad source")
+    check("source outside A/B rejected (422)", r.status_code == 422)
+    r = report(base1, source="A", id="ing-x", revision=1, side="train", text="tiny")
+    check("ingest text shorter than 5 chars rejected (422)", r.status_code == 422)
+    r = httpx.get(f"{base1}/ingest/articles/ing-x")
+    check("unknown ingest id answers 404", r.status_code == 404)
+
+    # ---- one source -> pending, no generation bump -------------------------
+    g0 = gen(base1)
+    r = report(base1, source="A", id="ing-1", revision=1, side="train", text=text_v1)
+    body = r.json()
+    check("first source report accepted as pending",
+          r.status_code == 200 and body["status"] == "pending"
+          and body["corpus_changed"] is False)
+    check("pending report does not bump the corpus generation", gen(base1) == g0)
+    check("pending article not in the corpus", "ing-1" not in corpus_ids(base1))
+
+    # ---- matching second source (other instance) -> approved ---------------
+    r = report(base2, source="B", id="ing-1", revision=1, side="train", text=text_v1)
+    body = r.json()
+    check("matching second source approves the article",
+          r.status_code == 200 and body["status"] == "approved"
+          and body["corpus_changed"] is True and body["generation"] == g0 + 1)
+    arts = {a["id"]: a for a in httpx.get(f"{base2}/articles").json()["articles"]}
+    check("approved article in corpus with origin=ingest",
+          arts.get("ing-1", {}).get("origin") == "ingest"
+          and arts["ing-1"]["side"] == "train" and arts["ing-1"]["text"] == text_v1)
+    check("manual articles keep origin=manual",
+          arts["train-clean-1"]["origin"] == "manual")
+
+    # ---- idempotent replays: no generation bump -----------------------------
+    g1 = gen(base1)
+    r = report(base2, source="B", id="ing-1", revision=1, side="train", text=text_v1)
+    check("same revision + same content replayed (no-op)",
+          r.status_code == 200 and r.json()["replayed"] is True
+          and r.json()["corpus_changed"] is False)
+    r = report(base1, source="A", id="ing-1", revision=1, side="train", text=text_v1)
+    check("cross-instance replay is a no-op too", r.status_code == 200
+          and r.json()["replayed"] is True)
+    check("replays do not advance the corpus generation", gen(base1) == g1)
+
+    # ---- same revision different content / stale revision -------------------
+    r = report(base1, source="A", id="ing-1", revision=1, side="test", text=text_v1)
+    check("same revision, different side rejected (409)", r.status_code == 409)
+    r = report(base1, source="B", id="ing-1", revision=1, side="train", text=text_v2)
+    check("same revision, different text rejected (409)", r.status_code == 409)
+
+    # ---- revision bump creates a conflict -> withdrawal ---------------------
+    r = report(base1, source="A", id="ing-1", revision=2, side="train", text=text_v2)
+    body = r.json()
+    check("diverging new revision -> conflict, article withdrawn",
+          r.status_code == 200 and body["status"] == "conflict"
+          and body["corpus_changed"] is True)
+    check("withdrawn article left the corpus", "ing-1" not in corpus_ids(base1))
+    r = httpx.get(f"{base1}/ingest/articles/ing-1")
+    body = r.json()
+    check("conflict query shows both source versions",
+          body["status"] == "conflict" and body["conflicts"] == ["text"]
+          and body["sources"]["A"]["revision"] == 2
+          and body["sources"]["B"]["revision"] == 1
+          and body["sources"]["A"]["text"] == text_v2
+          and body["sources"]["B"]["text"] == text_v1
+          and body["in_corpus"] is False)
+
+    # ---- late/stale reports cannot resurrect --------------------------------
+    r = report(base1, source="A", id="ing-1", revision=1, side="train", text=text_v1)
+    check("older revision rejected as stale (409)", r.status_code == 409)
+    check("stale replay did not resurrect the article",
+          "ing-1" not in corpus_ids(base1))
+
+    # ---- second source converges -> approved again ---------------------------
+    g2 = gen(base1)
+    r = report(base2, source="B", id="ing-1", revision=2, side="train", text=text_v2)
+    check("converging revision re-approves the article",
+          r.status_code == 200 and r.json()["status"] == "approved"
+          and r.json()["generation"] == g2 + 1)
+    check("re-approved article back in the corpus", "ing-1" in corpus_ids(base1))
+
+    # ---- retraction withdraws; late content cannot resurrect -----------------
+    g3 = gen(base1)
+    r = report(base1, source="A", id="ing-1", revision=3, retracted=True)
+    check("retraction withdraws the approved article",
+          r.status_code == 200 and r.json()["status"] == "retracted"
+          and r.json()["corpus_changed"] is True
+          and r.json()["generation"] == g3 + 1)
+    check("retracted article out of the corpus", "ing-1" not in corpus_ids(base1))
+    r = report(base1, source="A", id="ing-1", revision=2, side="train", text=text_v2)
+    check("late pre-retraction content rejected (409)", r.status_code == 409)
+    check("late report did not resurrect the retracted article",
+          "ing-1" not in corpus_ids(base1))
+    g4 = gen(base1)
+    r = report(base1, source="A", id="ing-1", revision=3, retracted=True)
+    check("retraction replay is an idempotent no-op",
+          r.status_code == 200 and r.json()["replayed"] is True)
+    r = report(base2, source="B", id="ing-1", revision=3, retracted=True)
+    check("second source retracting changes nothing further",
+          r.status_code == 200 and r.json()["corpus_changed"] is False)
+    check("no recomputation while the approved corpus is unchanged",
+          gen(base1) == g4)
+
+    # ---- newer revisions after retraction can re-approve ---------------------
+    r = report(base1, source="A", id="ing-1", revision=4, side="test", text=text_v1)
+    check("content after retraction accepted, still blocked by other source",
+          r.status_code == 200 and r.json()["status"] == "retracted"
+          and r.json()["corpus_changed"] is False)
+    r = report(base2, source="B", id="ing-1", revision=4, side="test", text=text_v1)
+    check("both sources' new revisions approve again (side updated)",
+          r.status_code == 200 and r.json()["status"] == "approved")
+    arts = {a["id"]: a for a in httpx.get(f"{base1}/articles").json()["articles"]}
+    check("re-approved article carries the new side",
+          arts["ing-1"]["side"] == "test")
+
+    # ---- manual/ingest namespace isolation -----------------------------------
+    r = httpx.post(f"{base1}/articles/batch",
+                   json={"upserts": [{"id": "ing-manual-1", "side": "train",
+                                      "text": "a manually maintained article about health"}]})
+    check("manual seed article committed", r.status_code == 200)
+    r = report(base1, source="A", id="ing-manual-1", revision=1, side="train",
+               text="a manually maintained article about health")
+    check("ingestion must not overwrite a manual article (409)", r.status_code == 409)
+    r = httpx.post(f"{base1}/articles/batch",
+                   json={"upserts": [{"id": "ing-1", "side": "train",
+                                      "text": "manual edit of an ingest-managed id"},
+                                     {"id": "ing-manual-2", "side": "test",
+                                      "text": "innocent bystander article about courts"}]})
+    check("manual edit of ingest-managed id rejected (409)", r.status_code == 409)
+    check("rejected batch applied nothing (atomicity)",
+          "ing-manual-2" not in corpus_ids(base1))
+    r = httpx.post(f"{base1}/articles/batch", json={"deletes": ["ing-1"]})
+    check("manual delete of ingest-managed id rejected (409)", r.status_code == 409)
+    check("ingest-managed article untouched by manual delete",
+          "ing-1" in corpus_ids(base1))
+
+    # ---- list endpoint --------------------------------------------------------
+    r = httpx.get(f"{base2}/ingest/articles")
+    summaries = {s["id"]: s for s in r.json()}
+    check("ingest list shows tracked ids with verdicts",
+          summaries.get("ing-1", {}).get("status") == "approved"
+          and summaries["ing-1"]["revisions"] == {"A": 4, "B": 4}
+          and summaries["ing-1"]["in_corpus"] is True)
+
+    # ---- ingested near-duplicates flow into /contamination --------------------
+    dup_base = pseudo_article(rng)
+    dup_alt = alter(dup_base, [100], rng)
+    for aid, side, text in [("ing-dup-a", "train", dup_base), ("ing-dup-b", "test", dup_alt)]:
+        for source, base in [("A", base1), ("B", base2)]:
+            r = report(base, source=source, id=aid, revision=1, side=side, text=text)
+            assert r.status_code == 200, r.text
+    r = httpx.get(f"{base1}/contamination")
+    check("202 while ingest-driven changes await verification", r.status_code == 202)
+    wait_ready(base2)
+    r = httpx.get(f"{base2}/contamination")
+    pairs = {tuple(sorted((e["a"], e["b"]))) for g in r.json()["groups"] for e in g["edges"]}
+    check("ingested near-duplicate pair detected by verification",
+          ("ing-dup-a", "ing-dup-b") in pairs, str(pairs))
+
+    # ---- concurrent cross-instance reports settle consistently ----------------
+    def post_report(base, payload):
+        return httpx.post(f"{base}/ingest/reports", json=payload, timeout=30)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        futures = []
+        for i in range(6):
+            aid = f"ing-conc-{i}"
+            text = pseudo_article(rng)
+            futures.append(pool.submit(
+                post_report, base1,
+                {"source": "A", "id": aid, "revision": 1, "side": "train", "text": text}))
+            futures.append(pool.submit(
+                post_report, base2,
+                {"source": "B", "id": aid, "revision": 1, "side": "train", "text": text}))
+        responses = [f.result() for f in futures]
+    check("all concurrent reports accepted",
+          all(r.status_code == 200 for r in responses))
+    per_article = {}
+    for r in responses:
+        per_article.setdefault(r.json()["id"], []).append(r.json()["status"])
+    check("each concurrently reported article saw exactly one pending + one approved",
+          all(sorted(v) == ["approved", "pending"] for v in per_article.values()),
+          str(per_article))
+    ids_now = corpus_ids(base2)
+    check("all concurrently approved articles committed to the corpus",
+          all(f"ing-conc-{i}" in ids_now for i in range(6)))
+    wait_ready(base1)
+    final = httpx.get(f"{base1}/status").json()
+    check("verification caught up after concurrent ingest",
+          final["up_to_date"] is True)
+    check("status exposes ingest verdict counters",
+          final["ingest"]["approved"] >= 8 and final["ingest"]["tracked_ids"] >= 8)
 
 
 if __name__ == "__main__":

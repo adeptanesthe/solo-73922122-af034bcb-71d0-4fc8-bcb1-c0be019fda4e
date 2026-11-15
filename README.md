@@ -7,6 +7,8 @@
 - 以**原文连续 5 字符 shingle 集合的 Jaccard 相似度 ≥ 0.8** 连边，按连通分量分组
 - 相似边与分组**持久化**，按语料代次（generation）发布；查询只读已发布结果，不做现场全量比对
 - 仅当已发布结果**覆盖当前全部已提交语料**时才给出核查结论（200），否则返回 **202 + 待核查状态**
+- **双源核验采集**：同一稿件由两条独立抓取链路上报，两边最新原文与 train/test 归属一致才核准入库；
+  冲突或任一源撤稿即撤出，迟到上报无法让旧稿复活
 
 ## 快速开始
 
@@ -57,6 +59,9 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
     --restart-cmd "docker compose restart api1 api2"
 # 本地模式：--restart-cmd "scripts/local_dev.sh restart"
 
+# 5) 双源核验采集：两源一致才入库、冲突/撤稿撤出、迟到上报不复活旧稿
+python3 scripts/demo.py ingest --base http://localhost:8001
+
 # 或一次跑完：demo.py all --base ... --restart-cmd ...
 ```
 
@@ -64,10 +69,13 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
 
 | 方法/路径 | 说明 |
 |---|---|
-| `POST /articles/batch` | 整批补录/更正/删除：`{"upserts": [{id, side, text}], "deletes": [id]}`。**单事务原子生效**，任一失败整批回滚 |
-| `GET /articles` | 当前已提交语料列表 |
+| `POST /articles/batch` | 手工整批补录/更正/删除：`{"upserts": [{id, side, text}], "deletes": [id]}`。**单事务原子生效**，任一失败整批回滚 |
+| `GET /articles` | 当前已提交语料列表（含 `origin`: `manual`/`ingest`） |
+| `POST /ingest/reports` | 采集上报（逐条）：`{"source": "A"\|"B", "id", "revision", "side", "text"}` 或 `{"source", "id", "revision", "retracted": true}` 撤稿。来源版本、核准稿件与核查作业**单事务一致提交** |
+| `GET /ingest/articles/{id}` | 按 ID 查询两源各自最新版本（修订号、原文、归属、是否撤稿）与冲突状态，供采集员重抓 |
+| `GET /ingest/articles` | 全部采集接管的 ID 及其核验结论 |
 | `GET /contamination` | 核查结论。`200`：跨集合污染组、成员、直接相似边；`202`：待核查（附 current/published 代次） |
-| `GET /status` | 实例、代次、语料计数、后台作业状态 |
+| `GET /status` | 实例、代次、语料计数（含 manual/ingest 分布）、采集核验统计、后台作业状态 |
 | `GET /docs` | Swagger UI |
 
 校验规则：文章 ID 1–128 字符；`side ∈ {train, test}`；原文 5–2000 字符；
@@ -97,6 +105,36 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
   ]
 }
 ```
+
+## 双源核验采集（ingest）
+
+采集员从两条独立抓取链路（来源 A/B）接收同一稿件，**只有两边最新原文与
+train/test 归属一致、且任一源都未撤稿**时，稿件才核准进入语料。
+
+每条上报携带 `source`、`id`、`revision`（递增修订号）及 `text`+`side`，或
+`retracted: true`（撤稿）。每个 （稿件， 来源） 只保留最新一条已接受上报，
+稿件级结论由两源最新上报推导：
+
+| 状态 | 条件 | 语料 |
+|---|---|---|
+| `pending` | 仅一源到达 | 待核，不入库 |
+| `approved` | 两源均有内容且原文+归属一致 | 核准入库（`origin=ingest`） |
+| `conflict` | 两源内容不一致（`conflicts` 标明 `text`/`side`） | 撤出此前核准的稿件 |
+| `retracted` | 任一源最新上报为撤稿 | 撤出此前核准的稿件 |
+
+规则：
+
+- **修订号单调递增**（按 稿件×来源 计）：同版同内容重传是幂等空操作
+  （`replayed: true`，不推进语料代次）；同版异内容与旧版一律 409 拒绝——
+  因此**迟到上报无法让已修订或已撤稿的旧稿复活**。
+- **一致提交**：来源版本、核准稿件投影与核查作业在同一事务内落库；两个实例
+  并发上报时由 SQLite 写事务串行化，最终结果只有"先 pending 后 approved"一种。
+- **只有核准稿件变化才重算**：待核、冲突、撤稿重传等不改变已核准语料的上报
+  不推进代次、不触发核查作业。
+- **命名空间隔离**：已有手工稿件（`origin=manual`）的 ID 拒绝采集上报（409）；
+  采集接管的 ID 拒绝手工批改/删除（409，整批回滚）。
+- 撤稿不是终身封禁：任一源以**更高修订号**重新上报内容后，按最新两源状态
+  重新推导（可再次核准）。
 
 ## 设计：为什么这些需求同时成立
 
@@ -140,21 +178,24 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
 ## 验证
 
 ```bash
-python3 tests/e2e_check.py     # 34 项需求检查：校验、原子性、300 上限、202 门控、
-                               # 桥接拆组、并发提交、旧算丢弃、崩溃重启恢复、不混版
+python3 tests/e2e_check.py     # 82 项需求检查：校验、原子性、300 上限、202 门控、
+                               # 桥接拆组、并发提交、旧算丢弃、崩溃重启恢复、不混版、
+                               # 双源核验（待核/核准/冲突/撤稿、幂等重传、旧版拒绝、
+                               # 迟到不复活、手工/采集隔离、跨实例并发一致）
 ```
 
 ## 结构
 
 ```
 app/
-  main.py        FastAPI 端点与生命周期
-  db.py          SQLite 连接/建表（WAL）
+  main.py        FastAPI 端点与生命周期（手工批次 + 双源核验上报/查询）
+  db.py          SQLite 连接/建表（WAL），articles.origin 迁移
+  ingest.py      双源核验状态机（两源最新上报 -> 核准/待核/冲突/撤稿）
   similarity.py  5 字符 shingle、Jaccard、连通分量
   worker.py      后台比对 worker（租约认领、快照、原子发布）
-  schemas.py     请求模型（5–2000 字符等校验）
+  schemas.py     请求模型（5–2000 字符、上报载荷一致性等校验）
 scripts/
-  demo.py        演示数据（含桥接文章）+ 四个场景
+  demo.py        演示数据（含桥接文章）+ 五个场景（含 ingest 双源核验）
   local_dev.sh   无 Docker 的双进程本地运行器
 tests/
   e2e_check.py   端到端需求验证（自起两个进程共库）

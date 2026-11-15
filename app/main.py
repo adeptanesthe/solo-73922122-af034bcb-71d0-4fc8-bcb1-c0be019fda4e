@@ -7,6 +7,19 @@ background verification job. Verification results (direct similarity edges
 and connected groups) are persisted per generation and published
 atomically; queries never compare texts on the fly.
 
+Articles enter the corpus two ways:
+
+- manually, via atomic batches (POST /articles/batch), and
+- by dual-source ingestion (POST /ingest/reports): collectors report each
+  article from two independent crawl pipelines, and only when both
+  pipelines' latest reports agree on text and train/test side (and neither
+  retracted it) is the article approved into the corpus. Source versions,
+  the approved projection and the verification job commit in one
+  transaction; only changes to the approved corpus bump the generation.
+
+The two namespaces are protected from each other: ingestion never
+overwrites manual articles, and ingestion-managed ids reject manual edits.
+
 Freshness rule: /contamination answers 200 only when the published results
 cover the whole currently committed corpus (published_generation ==
 current_generation); otherwise it answers 202 with the pending state, so
@@ -26,7 +39,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from .db import MAX_ARTICLES, connect, get_meta, init_db
-from .schemas import BatchRequest, BatchResponse
+from .ingest import KIND_CONTENT, KIND_RETRACTION, derive_ingest_state
+from .schemas import (
+    BatchRequest,
+    BatchResponse,
+    IngestArticleStatus,
+    IngestArticleSummary,
+    IngestReport,
+    IngestReportResponse,
+    IngestSources,
+    SourceVersion,
+)
 from .worker import CompareWorker
 
 logging.basicConfig(
@@ -133,6 +156,23 @@ def apply_batch(req: BatchRequest):
             current, _ = get_meta(conn)
             new_generation = current + 1
 
+            # Ids taken over by ingestion refuse manual edits. Checked inside
+            # the write transaction so a concurrent ingest report on another
+            # instance cannot slip past this guard.
+            touched = sorted(set(upsert_ids) | set(req.deletes))
+            placeholders = ",".join("?" for _ in touched)
+            managed = conn.execute(
+                f"SELECT DISTINCT article_id FROM ingest_reports"
+                f" WHERE article_id IN ({placeholders})",
+                touched,
+            ).fetchall()
+            if managed:
+                raise HTTPException(
+                    409,
+                    "article ids managed by ingestion, manual edits refused: "
+                    f"{sorted(r['article_id'] for r in managed)}",
+                )
+
             deleted = 0
             for article_id in req.deletes:
                 cur = conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
@@ -140,8 +180,8 @@ def apply_batch(req: BatchRequest):
             for u in req.upserts:
                 conn.execute(
                     """
-                    INSERT INTO articles (id, side, text, updated_generation)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO articles (id, side, text, origin, updated_generation)
+                    VALUES (?, ?, ?, 'manual', ?)
                     ON CONFLICT(id) DO UPDATE SET
                         side = excluded.side,
                         text = excluded.text,
@@ -195,13 +235,278 @@ def apply_batch(req: BatchRequest):
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# dual-source ingestion (双源核验)
+# ---------------------------------------------------------------------------
+
+def _ingest_rows(conn, article_id: str):
+    return conn.execute(
+        "SELECT article_id, source, revision, kind, side, text, updated_at"
+        " FROM ingest_reports WHERE article_id = ?",
+        (article_id,),
+    ).fetchall()
+
+
+def _source_version(row) -> SourceVersion:
+    return SourceVersion(
+        revision=row["revision"],
+        kind=row["kind"],
+        side=row["side"],
+        text=row["text"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _ingest_status_model(article_id: str, rows, in_corpus: bool) -> IngestArticleStatus:
+    status, approved_side, approved_text, conflicts = derive_ingest_state(rows)
+    by_source = {r["source"]: r for r in rows}
+    return IngestArticleStatus(
+        id=article_id,
+        status=status,
+        in_corpus=in_corpus,
+        conflicts=conflicts,
+        sources=IngestSources(
+            A=_source_version(by_source["A"]) if "A" in by_source else None,
+            B=_source_version(by_source["B"]) if "B" in by_source else None,
+        ),
+        approved_side=approved_side,
+        approved_text=approved_text,
+    )
+
+
+@app.post("/ingest/reports", response_model=IngestReportResponse)
+def submit_ingest_report(req: IngestReport):
+    """Report one article from one crawl pipeline (or retract it).
+
+    The source version, the approved-corpus projection and the verification
+    job commit in a single transaction, so concurrent reports on the two API
+    instances always settle into one consistent state. Re-sending the same
+    revision with identical content is an idempotent no-op (the corpus
+    generation does not advance); the same revision with different content
+    and older revisions are rejected, so a late report can never resurrect
+    an article that was revised or retracted since.
+    """
+    kind = KIND_RETRACTION if req.retracted else KIND_CONTENT
+    conn = connect(DB_PATH)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Manual articles are never touched by ingestion.
+            article = conn.execute(
+                "SELECT origin, side, text FROM articles WHERE id = ?", (req.id,)
+            ).fetchone()
+            if article is not None and article["origin"] == "manual":
+                raise HTTPException(
+                    409,
+                    f"article {req.id!r} is managed manually; ingestion refused",
+                )
+
+            stored = conn.execute(
+                "SELECT revision, kind, side, text FROM ingest_reports"
+                " WHERE article_id = ? AND source = ?",
+                (req.id, req.source),
+            ).fetchone()
+            if stored is not None:
+                if req.revision < stored["revision"]:
+                    raise HTTPException(
+                        409,
+                        f"stale revision {req.revision} for source {req.source} of "
+                        f"{req.id!r}: latest accepted is {stored['revision']}",
+                    )
+                if req.revision == stored["revision"]:
+                    identical = (
+                        stored["kind"] == kind
+                        and stored["side"] == req.side
+                        and stored["text"] == req.text
+                    )
+                    if not identical:
+                        raise HTTPException(
+                            409,
+                            f"revision {req.revision} for source {req.source} of "
+                            f"{req.id!r} was already recorded with different content",
+                        )
+                    # Idempotent replay: nothing changes, no generation bump.
+                    rows = _ingest_rows(conn, req.id)
+                    status, _, _, _ = derive_ingest_state(rows)
+                    current, published = get_meta(conn)
+                    conn.commit()
+                    return IngestReportResponse(
+                        accepted=True,
+                        replayed=True,
+                        id=req.id,
+                        source=req.source,
+                        revision=req.revision,
+                        status=status,
+                        corpus_changed=False,
+                        generation=current,
+                        published_generation=published,
+                    )
+
+            conn.execute(
+                """
+                INSERT INTO ingest_reports
+                    (article_id, source, revision, kind, side, text, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(article_id, source) DO UPDATE SET
+                    revision = excluded.revision,
+                    kind = excluded.kind,
+                    side = excluded.side,
+                    text = excluded.text,
+                    updated_at = excluded.updated_at
+                """,
+                (req.id, req.source, req.revision, kind, req.side, req.text,
+                 time.time()),
+            )
+
+            # Project the freshly derived verdict onto the corpus.
+            rows = _ingest_rows(conn, req.id)
+            status, approved_side, approved_text, _ = derive_ingest_state(rows)
+            action = None  # None | "upsert" | "delete"
+            if approved_side is not None:
+                if article is None:
+                    count = conn.execute(
+                        "SELECT COUNT(*) AS c FROM articles"
+                    ).fetchone()["c"]
+                    if count + 1 > MAX_ARTICLES:
+                        raise HTTPException(
+                            409,
+                            f"corpus limit exceeded: approving {req.id!r} would leave "
+                            f"{count + 1} articles (max {MAX_ARTICLES}); "
+                            "report rolled back",
+                        )
+                    action = "upsert"
+                elif article["side"] != approved_side or article["text"] != approved_text:
+                    action = "upsert"
+            elif article is not None:
+                # Verdict moved to pending/conflict/retracted: withdraw the
+                # previously approved article (origin is 'ingest' here —
+                # manual rows were rejected above).
+                action = "delete"
+
+            current, _ = get_meta(conn)
+            generation = current
+            corpus_changed = action is not None
+            if corpus_changed:
+                generation = current + 1
+                if action == "upsert":
+                    conn.execute(
+                        """
+                        INSERT INTO articles (id, side, text, origin, updated_generation)
+                        VALUES (?, ?, ?, 'ingest', ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            side = excluded.side,
+                            text = excluded.text,
+                            origin = 'ingest',
+                            updated_generation = excluded.updated_generation
+                        """,
+                        (req.id, approved_side, approved_text, generation),
+                    )
+                else:
+                    conn.execute("DELETE FROM articles WHERE id = ?", (req.id,))
+                conn.execute(
+                    "UPDATE meta SET current_generation = ? WHERE id = 1",
+                    (generation,),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO compute_jobs (generation, status)"
+                    " VALUES (?, 'pending')",
+                    (generation,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        _, published = get_meta(conn)
+        log.info(
+            "ingest report committed: id=%s source=%s revision=%d status=%s "
+            "corpus_changed=%s generation=%d",
+            req.id, req.source, req.revision, status, corpus_changed, generation,
+        )
+        return IngestReportResponse(
+            accepted=True,
+            replayed=False,
+            id=req.id,
+            source=req.source,
+            revision=req.revision,
+            status=status,
+            corpus_changed=corpus_changed,
+            generation=generation,
+            published_generation=published,
+        )
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(422, f"report rejected, nothing applied: {exc}")
+    finally:
+        conn.close()
+
+
+@app.get("/ingest/articles/{article_id}", response_model=IngestArticleStatus)
+def get_ingest_article(article_id: str):
+    """Both pipelines' latest versions of one article and the conflict state.
+
+    This is what a collector inspects before re-crawling a mismatching or
+    retracted article.
+    """
+    conn = connect(DB_PATH)
+    try:
+        rows = _ingest_rows(conn, article_id)
+        if not rows:
+            raise HTTPException(
+                404, f"no ingestion state for article {article_id!r}"
+            )
+        in_corpus = (
+            conn.execute(
+                "SELECT 1 FROM articles WHERE id = ? AND origin = 'ingest'",
+                (article_id,),
+            ).fetchone()
+            is not None
+        )
+    finally:
+        conn.close()
+    return _ingest_status_model(article_id, rows, in_corpus)
+
+
+@app.get("/ingest/articles", response_model=list[IngestArticleSummary])
+def list_ingest_articles():
+    """All ingestion-managed article ids with their verdicts."""
+    conn = connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT article_id, source, revision, kind, side, text, updated_at"
+            " FROM ingest_reports ORDER BY article_id, source"
+        ).fetchall()
+        in_corpus = {
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM articles WHERE origin = 'ingest'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    by_article: dict[str, list] = {}
+    for row in rows:
+        by_article.setdefault(row["article_id"], []).append(row)
+    return [
+        IngestArticleSummary(
+            id=article_id,
+            status=derive_ingest_state(article_rows)[0],
+            in_corpus=article_id in in_corpus,
+            revisions={r["source"]: r["revision"] for r in article_rows},
+        )
+        for article_id, article_rows in sorted(by_article.items())
+    ]
+
+
 @app.get("/articles")
 def list_articles():
     """List the currently committed corpus."""
     conn = connect(DB_PATH)
     try:
         rows = conn.execute(
-            "SELECT id, side, text, updated_generation FROM articles ORDER BY id"
+            "SELECT id, side, text, origin, updated_generation FROM articles"
+            " ORDER BY id"
         ).fetchall()
     finally:
         conn.close()
@@ -213,6 +518,7 @@ def list_articles():
                 "side": r["side"],
                 "text": r["text"],
                 "text_length": len(r["text"]),
+                "origin": r["origin"],
                 "updated_generation": r["updated_generation"],
             }
             for r in rows
@@ -320,7 +626,9 @@ def status():
             """
             SELECT COUNT(*) AS total,
                    COALESCE(SUM(side = 'train'), 0) AS train,
-                   COALESCE(SUM(side = 'test'), 0) AS test
+                   COALESCE(SUM(side = 'test'), 0) AS test,
+                   COALESCE(SUM(origin = 'manual'), 0) AS manual,
+                   COALESCE(SUM(origin = 'ingest'), 0) AS ingest
             FROM articles
             """
         ).fetchone()
@@ -328,14 +636,39 @@ def status():
             "SELECT generation, status, claimed_by, claimed_at FROM compute_jobs"
             " ORDER BY generation"
         ).fetchall()
+        ingest_rows = conn.execute(
+            "SELECT article_id, source, kind, side, text FROM ingest_reports"
+        ).fetchall()
     finally:
         conn.close()
+
+    by_article: dict[str, list] = {}
+    for r in ingest_rows:
+        by_article.setdefault(r["article_id"], []).append(r)
+    verdicts: dict[str, int] = {}
+    for article_rows in by_article.values():
+        verdict = derive_ingest_state(article_rows)[0]
+        verdicts[verdict] = verdicts.get(verdict, 0) + 1
+
     return {
         "instance": INSTANCE_ID,
         "current_generation": current,
         "published_generation": published,
         "up_to_date": current == published,
-        "articles": {"total": row["total"], "train": row["train"], "test": row["test"]},
+        "articles": {
+            "total": row["total"],
+            "train": row["train"],
+            "test": row["test"],
+            "manual": row["manual"],
+            "ingest": row["ingest"],
+        },
+        "ingest": {
+            "tracked_ids": len(by_article),
+            "approved": verdicts.get("approved", 0),
+            "pending": verdicts.get("pending", 0),
+            "conflict": verdicts.get("conflict", 0),
+            "retracted": verdicts.get("retracted", 0),
+        },
         "jobs": [
             {
                 "generation": j["generation"],
